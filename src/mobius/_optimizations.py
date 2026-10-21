@@ -66,6 +66,7 @@ from mobius._passes import (
     Fp8KvCachePass,
     RemoveDeadGraphInputsPass,
 )
+from mobius.rewrite_rules._decompose_attention import NpuwAttentionPass
 from mobius._pipeline_contract import requires_arbitrary_attention_mask
 from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
@@ -477,7 +478,9 @@ def _get_optimization_passes(
     # An IR pass (not a rewrite rule) so it can rewire the op's 3 outputs, whose
     # KV-cache present tensors are graph outputs on some layers and dead on
     # shared-KV layers. Runs after the batched rewrite rules (lower_ir_passes).
-    if not caps.supports_attention:
+    if caps.npuw_attention and model_role == "decoder":
+        lower.append(("NpuwAttention", NpuwAttentionPass()))
+    elif not caps.supports_attention:
         lower.append(("DecomposeAttention", decompose_attention_pass()))
 
     # NOTE: MatMulNBits → QDQ lowering is handled by the InlinePass mechanism
@@ -775,6 +778,9 @@ def optimize_model(
 
     # Rewrites may insert producers after existing consumers.
     model.graph.sort()
+    if caps.preserve_linear_weight_orientation:
+        # Weight loading/folding happens later and may enter through several integrations.
+        model.graph.metadata_props['mobius.preserve_linear_weight_orientation'] = 'true'
     if caps.name == "onnx-standard":
         validate_standard_onnx(model, component=model.graph.name or model_role)
 
@@ -793,7 +799,8 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
         [
             common_passes.LiftConstantsToInitializersPass(),
             FoldConcatInitializersPass(),
-            FoldTransposedInitializerPass(),
+            FoldTransposedInitializerPass(preserve_linear_weights=model.graph.metadata_props.get(
+                'mobius.preserve_linear_weight_orientation') == 'true'),
             common_passes.RemoveUnusedNodesPass(),
         ]
     )(model)

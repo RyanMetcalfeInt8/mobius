@@ -28,6 +28,7 @@ _ORT_PROVIDER_NAMES: dict[str, str] = {
     "trt-rtx": "NvTensorRtRtx",
     "qnn": "QNN",
     "openvino": "OpenVINO",
+    "openvino-npu": "OpenVINO",
 }
 
 

@@ -71,6 +71,11 @@ class EpCapabilities:
             (query/key norm over the head dimension) to rank-3 and back via
             HtpRank4RMSNorm.  ``True`` leaves it unchanged.  Set ``False``
             only for the QNN HTP, which miscomputes rank-4 RMSNormalization.
+        npuw_attention: Emit dynamic-cache primitive Attention with Q scaling,
+            merged additive masks and an output guard after reshape for NPUW.
+            Unsupported attention forms raise instead of silently falling back.
+        preserve_linear_weight_orientation: Keep initializer Transpose feeding
+            MatMul RHS through post-loading folding for OpenVINO NPU export.
         supports_attention: ``False`` decomposes the fused opset-24
             ``Attention`` op into scaled-dot-product primitives
             (Reshape/Transpose/MatMul/Softmax/Add, plus Expand for GQA) via
@@ -157,6 +162,8 @@ class EpCapabilities:
     supports_fused_moe: bool = True
     supports_packed_multi_head_attention: bool = False
     supports_rank4_rmsnorm: bool = True
+    npuw_attention: bool = False
+    preserve_linear_weight_orientation: bool = False
     supports_attention: bool = True
     supports_matmul_nbits: bool = True
     supports_rotary_embedding: bool = True
@@ -299,6 +306,14 @@ def _register_builtins() -> None:
             name="openvino",
             gqa_dtypes=frozenset(),  # no GQA fusion — keep standard Attention ops
             qkv_pack_dtypes=frozenset(),  # no QKV packing
+            supports_skip_layer_norm=False,
+            provider_options={"device_type": "NPU"},
+            layered_per_layer_inputs=True,
+        ),
+        EpCapabilities(
+            name="openvino-npu",
+            npuw_attention=True,
+            preserve_linear_weight_orientation=True,
             supports_skip_layer_norm=False,
             provider_options={"device_type": "NPU"},
             layered_per_layer_inputs=True,

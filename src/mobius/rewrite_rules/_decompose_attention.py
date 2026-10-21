@@ -82,7 +82,7 @@ def _is_decomposable(node: ir.Node) -> bool:
     return True
 
 
-def _build_replacement(node: ir.Node) -> tuple[list[ir.Node], list[ir.Value]]:
+def _build_replacement(node: ir.Node, *, npuw: bool = False) -> tuple[list[ir.Node], list[ir.Value]]:
     """Build the SDPA decomposition for *node*.
 
     Returns ``(new_nodes, [y, present_key, present_value])``.
@@ -155,10 +155,20 @@ def _build_replacement(node: ir.Node) -> tuple[list[ir.Node], list[ir.Value]]:
     k_rep = repeat_kv(k_full)
     v_rep = repeat_kv(v_full)
 
+    if npuw:
+        if scale is None:
+            hd = tape.op("Gather", [tape.op("Shape", [q_bnsh]), c_ints([3])], {"axis": 0})
+            divisor = tape.op("Sqrt", [tape.op("CastLike", [hd, q_bnsh])])
+            q_bnsh = tape.op("Div", [q_bnsh, divisor])
+        else:
+            q_bnsh = tape.op("Mul", [q_bnsh, tape.op("CastLike", [c_floats([scale]), q_bnsh])])
+
     # scores = (Q @ Kᵀ) * scale  -> (B, Nq, Sq, Sk)
     k_t = tape.op("Transpose", [k_rep], {"perm": [0, 1, 3, 2]})
     scores = tape.op("MatMul", [q_bnsh, k_t])
-    if scale is not None:
+    if npuw:
+        pass  # Scaling Q keeps MatMul -> Add -> Softmax contiguous.
+    elif scale is not None:
         scale_c = tape.op("CastLike", [c_floats([scale]), scores])
         scores = tape.op("Mul", [scores, scale_c])
     else:
@@ -178,8 +188,33 @@ def _build_replacement(node: ir.Node) -> tuple[list[ir.Node], list[ir.Value]]:
         cap = tape.op("CastLike", [c_floats([softcap]), scores])
         scores = tape.op("Mul", [tape.op("Tanh", [tape.op("Div", [scores, cap])]), cap])
 
+    if npuw:
+        mask = None
+        if attn_mask is not None:
+            zero = tape.op("CastLike", [c_floats([0.0]), scores])
+            negative = tape.op("CastLike", [c_floats([float("-inf")]), scores])
+            mask = (tape.op("Where", [attn_mask, zero, negative])
+                    if attn_mask.dtype == ir.DataType.BOOL
+                    else tape.op("CastLike", [attn_mask, scores]))
+        if mask is not None:
+            # Opset-24 allows a shorter mask; missing key positions are masked.
+            rank = len(attn_mask.shape)
+            mask_len = tape.op("Gather", [tape.op("Shape", [mask]), c_ints([rank - 1])], {"axis": 0})
+            kv_len = tape.op("Gather", [tape.op("Shape", [k_full]), c_ints([2])], {"axis": 0})
+            pads = tape.op("Concat", [c_ints([0] * (2 * rank - 1)),
+                                     tape.op("Sub", [kv_len, mask_len])], {"axis": 0})
+            mask = tape.op("Pad", [mask, pads,
+                                   tape.op("Squeeze", [negative, c_ints([0])])], {"mode": "constant"})
+        if is_causal:
+            causal = _causal_bias(tape, c_ints, c_floats, q_bnsh, k_full, scores, None,
+                                  mask_negative=float("-inf"))
+            mask = causal if mask is None else tape.op("Add", [mask, causal])
+        if mask is None:
+            mask = tape.op("CastLike", [c_floats([0.0]), scores])
+        scores = tape.op("Add", [scores, mask])
+
     # Additive float mask (broadcasts over the head axis).
-    if attn_mask is not None:
+    if attn_mask is not None and not npuw:
         scores = tape.op("Add", [scores, tape.op("CastLike", [attn_mask, scores])])
 
     static_sk = _static_kv_length(node)
@@ -196,7 +231,7 @@ def _build_replacement(node: ir.Node) -> tuple[list[ir.Node], list[ir.Value]]:
 
     # Built-in causal masking (bottom-right aligned so a decode step of Sq
     # queries attends to all Sk = Sq + past keys up to its own position).
-    if is_causal:
+    if is_causal and not npuw:
         scores = tape.op(
             "Add",
             [
@@ -210,6 +245,11 @@ def _build_replacement(node: ir.Node) -> tuple[list[ir.Node], list[ir.Value]]:
     out = tape.op("Transpose", [out], {"perm": [0, 2, 1, 3]})  # (B, Sq, Nq, H)
     y = tape.op("Reshape", [out, c_ints([0, 0, -1])])  # (B, Sq, Nq*H)
 
+    if npuw and (attn_mask is not None or is_causal):
+        # Preserve the frontend's NaN-to-zero semantics after the layout operations,
+        # leaving the NPUW MatMul -> Transpose -> Reshape pattern contiguous.
+        y = tape.op("Where", [tape.op("IsNaN", [y]),
+                              tape.op("CastLike", [c_floats([0.0]), y]), y])
     return tape.nodes, [y, present_k, present_v]
 
 
@@ -259,7 +299,7 @@ def _nonpad_bias(tape, c_ints, c_floats, nonpad, k_full, scores, static_sk):
     return tape.op("Where", [allowed, zero_f, neg_f])
 
 
-def _causal_bias(tape, c_ints, c_floats, q_bnsh, k_full, scores, static_sk):
+def _causal_bias(tape, c_ints, c_floats, q_bnsh, k_full, scores, static_sk, *, mask_negative=_MASK_NEG):
     """Bottom-right-aligned ``(1, 1, Sq, Sk)`` causal additive bias.
 
     Query row ``i`` (within the current chunk of ``Sq``) may attend to key
@@ -288,7 +328,7 @@ def _causal_bias(tape, c_ints, c_floats, q_bnsh, k_full, scores, static_sk):
     cols_2d = tape.op("Unsqueeze", [cols, c_ints([0])])  # (1, Sk)
     allowed = tape.op("LessOrEqual", [cols_2d, rows_off])  # (Sq, Sk) bool
     zero_f = tape.op("CastLike", [c_floats([0.0]), scores])
-    neg_f = tape.op("CastLike", [c_floats([_MASK_NEG]), scores])
+    neg_f = tape.op("CastLike", [c_floats([mask_negative]), scores])
     bias = tape.op("Where", [allowed, zero_f, neg_f])  # (Sq, Sk)
     return tape.op("Unsqueeze", [bias, c_ints([0, 1])])  # (1, 1, Sq, Sk)
 
@@ -329,3 +369,41 @@ def decompose_attention_pass() -> DecomposeAttentionPass:
     QNN HTP). The transform is numerically equivalent to the fused op.
     """
     return DecomposeAttentionPass()
+
+
+class NpuwAttentionPass(DecomposeAttentionPass):
+    """Dynamic rank-3 attention export matching NPUW's decomposed core.
+
+    Unsupported forms fail before mutation. NaN replacement is retained after
+    the output reshape, rather than interrupting Softmax/MatMul or layout ops.
+    """
+
+    def call(self, model: ir.Model) -> ir.passes.PassResult:
+        targets = [n for n in model.graph if n.op_type == "Attention" and n.domain in ("", "ai.onnx")]
+        for node in targets:
+            if (
+                len(node.inputs) > 3
+                and node.inputs[3] is not None
+                and (node.inputs[3].shape is None or len(node.inputs[3].shape) == 0)
+            ):
+                raise ValueError("openvino-npu requires a mask with known nonzero rank")
+            if (
+                    not _is_decomposable(node)
+                    or node.attributes.get_float("softcap", 0.0)
+                    or len(node.outputs) > 3
+                    or (len(node.inputs) > 6 and node.inputs[6] is not None)
+                    or len(node.inputs) < 6
+                    or node.inputs[4] is None or node.inputs[5] is None
+                    or node.attributes.get_int("softmax_precision", 0)
+                    or any(x.shape is None or len(x.shape) != 4 for x in node.inputs[4:6])):
+                raise ValueError(
+                    "openvino-npu requires rank-3 dynamic-cache Attention without "
+                    "softcap, nonpad, QK outputs or softmax_precision"
+                )
+        for node in targets:
+            nodes, values = _build_replacement(node, npuw=True)
+            ir.convenience.replace_nodes_and_values(
+                model.graph, insertion_point=node, old_nodes=[node], new_nodes=nodes,
+                old_values=list(node.outputs), new_values=values[:len(node.outputs)],
+            )
+        return ir.passes.PassResult(model, modified=bool(targets))

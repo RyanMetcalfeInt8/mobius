@@ -54,6 +54,10 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
     initializer-dedup pass) will prune it if it has no remaining consumers.
     """
 
+    def __init__(self, *, preserve_linear_weights: bool = False):
+        super().__init__()
+        self.preserve_linear_weights = preserve_linear_weights
+
     def call(self, model: ir.Model) -> ir.passes.PassResult:
         # Map from original initializer name → pre-transposed ir.Value, so
         # multiple Transpose nodes using the same initializer share one result.
@@ -89,6 +93,10 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
                 continue
 
             out_val = node.outputs[0]
+            if self.preserve_linear_weights and any(
+                use.node.op_type == 'MatMul' and use.idx == 1 for use in out_val.uses()
+            ):
+                continue
 
             if inp.name not in folded:
                 # Guard: if the source initializer has no weight data yet, the
