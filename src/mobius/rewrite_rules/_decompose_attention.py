@@ -63,16 +63,21 @@ from onnx_ir import tape as _tape
 _MASK_NEG = -3.0e38
 
 
-def _is_decomposable(node: ir.Node) -> bool:
+def _is_decomposable(node: ir.Node, *, allow_rank4: bool = False) -> bool:
     """Return True if *node* is a fused ``Attention`` op this pass can lower."""
     if node.op_type != "Attention" or node.domain not in ("", "ai.onnx"):
         return False
     q, k, v = node.inputs[0], node.inputs[1], node.inputs[2]
     for val in (q, k, v):
-        if val is None or val.shape is None or len(val.shape) != 3:
+        if val is None or val.shape is None or len(val.shape) not in ((3, 4) if allow_rank4 else (3,)):
             return False
-    q_heads = node.attributes.get_int("q_num_heads", 0)
-    kv_heads = node.attributes.get_int("kv_num_heads", 0)
+    rank4 = allow_rank4 and len(q.shape) == 4
+    if rank4 and any(len(val.shape) != 4 for val in (k, v)):
+        return False
+    q_heads = q.shape[1] if rank4 else node.attributes.get_int("q_num_heads", 0)
+    kv_heads = k.shape[1] if rank4 else node.attributes.get_int("kv_num_heads", 0)
+    if not isinstance(q_heads, int) or not isinstance(kv_heads, int):
+        return False
     if q_heads <= 0 or kv_heads <= 0 or q_heads % kv_heads != 0:
         return False
     # qk_matmul_output_mode!=0 (returning QK before/after softmax) is not a
@@ -102,14 +107,17 @@ def _build_replacement(node: ir.Node, *, npuw: bool = False) -> tuple[list[ir.No
     past_value = inputs[5] if len(inputs) > 5 else None
     nonpad_kv_seqlen = inputs[6] if len(inputs) > 6 else None
 
-    q_heads = node.attributes.get_int("q_num_heads")
-    kv_heads = node.attributes.get_int("kv_num_heads")
+    rank4 = len(q.shape) == 4
+    q_heads = q.shape[1] if rank4 else node.attributes.get_int("q_num_heads")
+    kv_heads = k.shape[1] if rank4 else node.attributes.get_int("kv_num_heads")
     group = q_heads // kv_heads
     scale = node.attributes.get_float("scale", None)
     softcap = node.attributes.get_float("softcap", 0.0) or 0.0
     is_causal = node.attributes.get_int("is_causal", 0)
 
     def split_heads(x, n_heads):
+        if rank4:
+            return x
         # (B, S, N*H) -> (B, S, N, H) -> (B, N, S, H). ``-1`` infers the head
         # dim, so no static head_dim is required (it may be a SymbolicDim).
         x4 = tape.op("Reshape", [x, c_ints([0, 0, n_heads, -1])])
@@ -242,8 +250,11 @@ def _build_replacement(node: ir.Node, *, npuw: bool = False) -> tuple[list[ir.No
 
     probs = tape.op("Softmax", [scores], {"axis": -1})
     out = tape.op("MatMul", [probs, v_rep])  # (B, Nq, Sq, H)
-    out = tape.op("Transpose", [out], {"perm": [0, 2, 1, 3]})  # (B, Sq, Nq, H)
-    y = tape.op("Reshape", [out, c_ints([0, 0, -1])])  # (B, Sq, Nq*H)
+    if rank4:
+        y = out
+    else:
+        out = tape.op("Transpose", [out], {"perm": [0, 2, 1, 3]})  # (B, Sq, Nq, H)
+        y = tape.op("Reshape", [out, c_ints([0, 0, -1])])  # (B, Sq, Nq*H)
 
     if npuw and (attn_mask is not None or is_causal):
         # Preserve the frontend's NaN-to-zero semantics after the layout operations,
@@ -372,7 +383,10 @@ def decompose_attention_pass() -> DecomposeAttentionPass:
 
 
 class NpuwAttentionPass(DecomposeAttentionPass):
-    """Dynamic rank-3 attention export matching NPUW's decomposed core.
+    """Rank-3 or rank-4 attention export matching NPUW's decomposed core.
+
+    Past caches are optional: KV-shared layers attend to full K/V tensors
+    supplied by another layer without owning a cache input themselves.
 
     Unsupported forms fail before mutation. NaN replacement is retained after
     the output reshape, rather than interrupting Softmax/MatMul or layout ops.
@@ -388,16 +402,15 @@ class NpuwAttentionPass(DecomposeAttentionPass):
             ):
                 raise ValueError("openvino-npu requires a mask with known nonzero rank")
             if (
-                    not _is_decomposable(node)
+                    not _is_decomposable(node, allow_rank4=True)
                     or node.attributes.get_float("softcap", 0.0)
                     or len(node.outputs) > 3
                     or (len(node.inputs) > 6 and node.inputs[6] is not None)
-                    or len(node.inputs) < 6
-                    or node.inputs[4] is None or node.inputs[5] is None
                     or node.attributes.get_int("softmax_precision", 0)
-                    or any(x.shape is None or len(x.shape) != 4 for x in node.inputs[4:6])):
+                    or any(x is not None and (x.shape is None or len(x.shape) != 4)
+                           for x in node.inputs[4:6])):
                 raise ValueError(
-                    "openvino-npu requires rank-3 dynamic-cache Attention without "
+                    "openvino-npu requires rank-3 or rank-4 Attention with optional rank-4 past caches, without "
                     "softcap, nonpad, QK outputs or softmax_precision"
                 )
         for node in targets:

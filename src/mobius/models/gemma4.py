@@ -1263,7 +1263,8 @@ class Gemma4TextAttention(nn.Module):
                 #   Static:  [B, max_seq, kv_heads*head_dim]    (3D updated cache)
                 # Static cache sources are already 3D — skip reshape.
                 is_static_source = src_key.shape is not None and len(src_key.shape) == 3
-                if not is_static_source:
+                keep_rank4_kv = ep_capabilities().npuw_attention and not is_static_source
+                if not is_static_source and not keep_rank4_kv:
                     shared_kv_hidden = self.num_key_value_heads * self.head_dim
                     src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
                     src_key = op.Reshape(src_key, [0, 0, shared_kv_hidden])
@@ -1277,20 +1278,33 @@ class Gemma4TextAttention(nn.Module):
                 # The nonpad_kv_seqlen path is NOT used here because ORT's
                 # is_causal=0 + nonpad_kv_seqlen triggers a CUDA kernel issue
                 # for KV-shared decode (S_q=1, S_kv=max_seq).
-                attn_output, present_key, present_value = _apply_attention(
-                    op,
-                    query_states,
-                    src_key,
-                    src_value,
-                    attention_bias,
-                    past_key=None,
-                    past_value=None,
-                    num_attention_heads=self.num_attention_heads,
-                    num_key_value_heads=self.num_key_value_heads,
-                    scale=self.scaling,
-                    softcap=self.softcap,
-                    is_causal=0,
-                )
+                if keep_rank4_kv:
+                    # ONNX rank-4 Attention consumes shared cache tensors directly.
+                    query4 = op.Transpose(
+                        op.Reshape(query_states, [0, 0, self.num_attention_heads, self.head_dim]),
+                        perm=[0, 2, 1, 3],
+                    )
+                    output4, present_key, present_value = op.Attention(
+                        query4, src_key, src_value, attention_bias,
+                        scale=self.scaling, softcap=self.softcap, is_causal=0,
+                        _outputs=3,
+                    )
+                    attn_output = op.Reshape(op.Transpose(output4, perm=[0, 2, 1, 3]), [0, 0, -1])
+                else:
+                    attn_output, present_key, present_value = _apply_attention(
+                        op,
+                        query_states,
+                        src_key,
+                        src_value,
+                        attention_bias,
+                        past_key=None,
+                        past_value=None,
+                        num_attention_heads=self.num_attention_heads,
+                        num_key_value_heads=self.num_key_value_heads,
+                        scale=self.scaling,
+                        softcap=self.softcap,
+                        is_causal=0,
+                    )
         elif use_gqa:
             # GQA path: emit com.microsoft.GroupQueryAttention directly.
             # The op fuses RoPE + attention + KV cache into a single op,
@@ -2237,7 +2251,7 @@ class Gemma4TextModel(nn.Module):
                     op.Constant(value_ints=[0, 0, num_layers, self._per_layer_dim]),
                 )
             )
-            if caps.name == "openvino":
+            if caps.name in ("openvino", "openvino-npu"):
                 per_layer_list = [
                     op.Gather(per_layer_4d, op.Constant(value_int=i), axis=2)
                     for i in range(num_layers)

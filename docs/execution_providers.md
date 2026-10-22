@@ -658,33 +658,16 @@ copy-on-write isolation for threads and coroutines.
 ### Experimental OpenVINO NPU export (`openvino-npu`)
 
 This profile preserves `[out,in]` linear weights and their Transpose into
-MatMul through post-loading initializer folding. The workspace NNCF helper
-with `--ep openvino-npu` also restores symmetric per-channel INT8 weight
-orientation after compression and emits f16 Cast/Mul decompression followed
-by a Cast back to the original floating-point type. Tied embedding/head
-weights stay shared. Asymmetric, blockwise and unsupported recipes are left
-unchanged. F16 decompression changes rounding and needs accuracy validation
-for the exported model; this optimization is currently verified on the
-workspace Llama 3.2 1B symmetric INT8 model.
+MatMul through post-loading initializer folding. The workspace compression
+script uses the patched NNCF ONNX backend directly: it maps quantization
+axes through Transpose and selects
+`AdvancedCompressionParameters(onnx_decompression_dtype="float16")`.
+No temporary weight transposition, sidecar or post-compression surgery is
+needed. Shared weights retain their original graph connections.
 
-The workspace helper accepts `--npu_fp16_exclude "*down_proj*"` to retain
-original f32 decompression for the MLP down projections while preserving
-weight orientation. This is a diagnostic workaround for target compiler
-input-channel tiling failures, not a verified fix on every NPU. Use
-`--npu_fp16_exclude "*"` to test orientation alone. Regenerate from the
-unquantized export; this option does not undo Cast/Mul paths in an already
-rewritten compressed model.
-
-For fresh symmetric INT8 compression, the helper temporarily folds unshared
-linear weight Transposes into `[in,out]` float weights before NNCF runs.
-This ensures NNCF quantizes along output channels. After compression it
-restores `[out,in]` INT8 weights with output-channel scales `[out,1]`.
-The temporary weight sidecar is created under the source component directory
-and removed after compression; that directory must be writable. Shared
-embedding/head weights retain their original layout and sharing. Earlier
-exports with preserved `[out,in]` weights but decoder scales `[1,in]` need
-recompression from the unquantized export; transposing their scales cannot
-change which channel axis was quantized.
+Use the local patched NNCF installation. F16 decompression changes rounding
+and needs accuracy validation. The `openvino-npu` profile selects f16
+decompression automatically; other profiles retain NNCF's default precision.
 
 Use `execution_provider="openvino-npu"` to build a Llama-style decoder for
 OpenVINO NPUW. This profile maps to the OpenVINO ORT provider with NPU as its

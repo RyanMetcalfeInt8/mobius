@@ -359,6 +359,64 @@ class TestDecomposeAttentionRewiring:
         assert Counter(n.op_type for n in model.graph).get("Attention", 0) == 1
 
 
+class TestNpuwSharedKvAttention:
+    @pytest.mark.parametrize("seq_q", [1, 3])
+    def test_rank4_shared_kv(self, seq_q):
+        from mobius.rewrite_rules._decompose_attention import NpuwAttentionPass
+
+        model = _build_attention_model(1, seq_q, 0, 4, 2, 8,
+                                       with_past=False, with_mask=True, is_causal=0)
+        node = next(iter(model.graph))
+        node.inputs[0].shape = ir.Shape([1, 4, seq_q, 8])
+        for value in node.inputs[1:3]:
+            value.shape = ir.Shape([1, 2, 7, 8])
+        node.inputs[3].shape = ir.Shape([1, 1, seq_q, 7])
+        del node.attributes["q_num_heads"]
+        del node.attributes["kv_num_heads"]
+        rng = np.random.default_rng(42)
+        feeds = {"q": rng.normal(size=(1, 4, seq_q, 8)).astype(np.float32),
+                 "k": rng.normal(size=(1, 2, 7, 8)).astype(np.float32),
+                 "v": rng.normal(size=(1, 2, 7, 8)).astype(np.float32),
+                 "mask": np.zeros((1, 1, seq_q, 7), np.float32)}
+        reference = _run(model, feeds)
+        NpuwAttentionPass()(model)
+        assert not any(n.op_type == "Attention" for n in model.graph)
+        # K/V are consumed directly, without a flatten/split-head round trip.
+        for value in model.graph.inputs[1:3]:
+            assert all(use.node.op_type in ("Unsqueeze", "Shape") for use in value.uses())
+        for expected, actual in zip(reference, _run(model, feeds)):
+            np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("seq_q,seq_k", [(1, 7), (3, 7)])
+    @pytest.mark.parametrize("output_count", [1, 3])
+    def test_shared_kv_without_own_cache(self, seq_q, seq_k, output_count):
+        from mobius.rewrite_rules._decompose_attention import NpuwAttentionPass
+
+        model = _build_attention_model(1, seq_q, 0, 4, 2, 8,
+                                       with_past=False, with_mask=True, is_causal=0)
+        node = next(iter(model.graph))
+        node.inputs[1].shape = ir.Shape([1, seq_k, 16])
+        node.inputs[2].shape = ir.Shape([1, seq_k, 16])
+        node.inputs[3].shape = ir.Shape([1, 1, seq_q, seq_k])
+        if output_count == 1:
+            model.graph.outputs[:] = [node.outputs[0]]
+            replacement = ir.Node("", "Attention", inputs=list(node.inputs),
+                                  outputs=[ir.Value(name="y")], attributes=node.attributes)
+            ir.convenience.replace_nodes_and_values(model.graph, insertion_point=node,
+                old_nodes=[node], new_nodes=[replacement], old_values=[node.outputs[0]],
+                new_values=[replacement.outputs[0]])
+        rng = np.random.default_rng(42)
+        feeds = {"q": rng.normal(size=(1, seq_q, 32)).astype(np.float32),
+                 "k": rng.normal(size=(1, seq_k, 16)).astype(np.float32),
+                 "v": rng.normal(size=(1, seq_k, 16)).astype(np.float32),
+                 "mask": np.zeros((1, 1, seq_q, seq_k), np.float32)}
+        reference = _run(model, feeds)
+        NpuwAttentionPass()(model)
+        assert not any(n.op_type == "Attention" for n in model.graph)
+        for expected, actual in zip(reference, _run(model, feeds)):
+            np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+
 class TestDecomposeAttentionEpGating:
     def _build(self, ep: str, dtype: ir.DataType) -> Counter:
         import dataclasses
