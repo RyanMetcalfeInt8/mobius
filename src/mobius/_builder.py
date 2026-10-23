@@ -190,11 +190,51 @@ def build_from_module(
             kv_cache_scales=kv_cache_scales,
         )
 
+    _maybe_apply_openvino_shared_sdpa(package, module, resolved_task, execution_provider)
     _maybe_apply_opset_lowering(package, execution_provider)
     if execution_provider == "onnx-standard":
         for name, model in package.items():
             validate_standard_onnx(model, component=name)
     return package
+
+
+def _maybe_apply_openvino_shared_sdpa(
+    package: ModelPackage,
+    module: nn.Module,
+    task: ModelTask,
+    execution_provider: str,
+) -> None:
+    """Select the full-length-mask profile only for the standard dynamic ABI."""
+    if execution_provider != "openvino-sdpa":
+        return
+    from mobius._passes._openvino_sdpa import apply_openvino_shared_sdpa
+    from mobius.models.base import CausalLMModel, TextModel
+    from mobius.tasks._causal_lm import CausalLMTask
+
+    if (
+        type(module) is not CausalLMModel
+        or type(module.model) is not TextModel
+        or type(task) is not CausalLMTask
+        or task._static_cache
+        or task._paged_cache
+    ):
+        return
+    config = module.config
+    layer_types = getattr(config, "layer_types", None)
+    if (
+        config.dtype != ir.DataType.FLOAT
+        or getattr(config, "sliding_window", None)
+        or (
+            layer_types is not None
+            and (
+                len(layer_types) != config.num_hidden_layers
+                or any(t != "full_attention" for t in layer_types)
+            )
+        )
+    ):
+        return
+    for model in package.values():
+        apply_openvino_shared_sdpa(model, num_layers=config.num_hidden_layers)
 
 
 # Attention input index for the optional ``nonpad_kv_seqlen`` operand. This

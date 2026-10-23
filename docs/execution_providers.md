@@ -655,6 +655,32 @@ This is implemented using Python's `contextvars` module, which provides
 copy-on-write isolation for threads and coroutines.
 
 
+### Portable OpenVINO SDPA export (`openvino-sdpa`)
+
+`execution_provider="openvino-sdpa"` retains ONNX Attention for frontend SDPA
+conversion and preserves compressed linear-weight orientation. For a standard
+`CausalLMModel` / `TextModel` with full attention, float32 activations, and the
+dynamic-cache `CausalLMTask`, the builder emits one shared additive causal and
+padding mask and sets `Attention.is_causal=0`. The mask uses bottom-right causal
+alignment during cached decode.
+
+This profile uses the task's full-length mask contract: every layer's key/value
+cache has the same past sequence length, and `attention_mask` has shape
+`[batch, past_length + query_length]`. Padding is represented by zero entries
+inside this full-length tensor. Shortened mask tensors are outside this profile;
+the default export retains Attention-24's shortened-mask support.
+
+Eligible graphs select opset 23 to avoid per-layer runtime mask padding.
+Alpha=1 Swish is lowered to `x * Sigmoid(x)`; other operators and tensor types
+are checked for opset-23 compatibility before making changes. The model records
+the mask contract in `mobius.openvino_sdpa.mask_contract` metadata.
+
+Static/paged caches, sliding or mixed attention schedules, custom model/task
+classes, non-float32 activations, softcapped attention, and incompatible graphs
+keep the existing export. This selection is independent of
+`MOBIUS_ORT_LOWER_OPSET_FOR_EP`. The OpenVINO device can be selected at runtime;
+the provider configuration still defaults to NPU.
+
 ### Experimental OpenVINO NPU export (`openvino-npu`)
 
 This profile preserves `[out,in]` linear weights and their Transpose into
