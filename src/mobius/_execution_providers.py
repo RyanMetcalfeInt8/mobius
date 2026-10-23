@@ -311,6 +311,15 @@ def _register_builtins() -> None:
             layered_per_layer_inputs=True,
         ),
         EpCapabilities(
+            # Experimental portable OpenVINO profile: retain ONNX Attention for
+            # frontend SDPA conversion while preserving compressed-weight layout.
+            name="openvino-sdpa",
+            preserve_linear_weight_orientation=True,
+            supports_skip_layer_norm=False,
+            provider_options={"device_type": "NPU"},
+            layered_per_layer_inputs=True,
+        ),
+        EpCapabilities(
             name="openvino-npu",
             npuw_attention=True,
             preserve_linear_weight_orientation=True,

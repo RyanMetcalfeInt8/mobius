@@ -473,3 +473,16 @@ class TestDecomposeAttentionEpGating:
         assert ops.get("Attention", 0) == 0
         assert ops.get("GroupQueryAttention", 0) == 0
         assert ops.get("Softmax", 0) > 0
+
+    def test_openvino_sdpa_keeps_standard_attention(self):
+        from mobius._execution_providers import get_ep
+        from mobius.integrations.ort_genai.ep_config import make_provider_options
+
+        caps = get_ep("openvino-sdpa")
+        assert caps.preserve_linear_weight_orientation
+        assert caps.layered_per_layer_inputs
+        assert not caps.npuw_attention
+        assert "OpenVINO" in make_provider_options("openvino-sdpa")[0]
+        ops = self._build("openvino-sdpa", ir.DataType.FLOAT)
+        assert ops.get("Attention", 0) == 2
+        assert ops.get("Softmax", 0) == 0

@@ -1263,7 +1263,9 @@ class Gemma4TextAttention(nn.Module):
                 #   Static:  [B, max_seq, kv_heads*head_dim]    (3D updated cache)
                 # Static cache sources are already 3D — skip reshape.
                 is_static_source = src_key.shape is not None and len(src_key.shape) == 3
-                keep_rank4_kv = ep_capabilities().npuw_attention and not is_static_source
+                keep_rank4_kv = (
+                    ep_capabilities().npuw_attention or ep_capabilities().name == "openvino-sdpa"
+                ) and not is_static_source
                 if not is_static_source and not keep_rank4_kv:
                     shared_kv_hidden = self.num_key_value_heads * self.head_dim
                     src_key = op.Transpose(src_key, perm=[0, 2, 1, 3])
@@ -2251,7 +2253,7 @@ class Gemma4TextModel(nn.Module):
                     op.Constant(value_ints=[0, 0, num_layers, self._per_layer_dim]),
                 )
             )
-            if caps.name in ("openvino", "openvino-npu"):
+            if caps.name in ("openvino", "openvino-npu", "openvino-sdpa"):
                 per_layer_list = [
                     op.Gather(per_layer_4d, op.Constant(value_int=i), axis=2)
                     for i in range(num_layers)
