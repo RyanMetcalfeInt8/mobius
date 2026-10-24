@@ -60,6 +60,7 @@ from onnxscript.rewriter import rewrite
 
 from mobius._execution_providers import EpCapabilities, ep_registry
 from mobius._flags import flags
+from mobius._passes._fold_rms_scale import FoldRmsScalePass
 from mobius._passes import (
     FoldConcatInitializersPass,
     FoldTransposedInitializerPass,
@@ -786,9 +787,10 @@ def optimize_model(
 
 
 def fold_initializers_after_weights(model: ir.Model) -> None:
-    """Fold weight ``Transpose`` and ``Concat`` nodes after weights are loaded.
+    """Fold constant RMS scales and weight layouts after weights are loaded.
 
     Runs :class:`~onnx_ir.passes.common.LiftConstantsToInitializersPass`,
+    :class:`~mobius._passes._fold_rms_scale.FoldRmsScalePass`,
     :class:`~mobius._passes.FoldConcatInitializersPass`,
     :class:`~mobius._passes.FoldTransposedInitializerPass`, and
     :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` in order.
@@ -798,6 +800,7 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
     ir.passes.PassManager(
         [
             common_passes.LiftConstantsToInitializersPass(),
+            FoldRmsScalePass(),
             FoldConcatInitializersPass(),
             FoldTransposedInitializerPass(preserve_linear_weights=model.graph.metadata_props.get(
                 'mobius.preserve_linear_weight_orientation') == 'true'),
