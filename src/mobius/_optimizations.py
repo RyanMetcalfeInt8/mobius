@@ -613,6 +613,14 @@ def optimize_model(
         # ops like CausalConvWithState and LinearAttention registered per-model.
         if caps.name == "onnx-standard" and func.domain not in _STANDARD_ONNX_DOMAINS:
             return True
+        # OpenVINO does not expand these model-local Microsoft functions.
+        # Their standard ONNX bodies preserve the recurrent-state interface.
+        if (
+            caps.name in ("openvino", "openvino-sdpa", "openvino-npu")
+            and func.domain == "com.microsoft"
+            and func.name in ("CausalConvWithState", "LinearAttention")
+        ):
+            return True
         # ORT's CUDA EP has no CausalConvWithState kernel. Keeping the local
         # function call causes TransformerMemcpy to inspect a node without a
         # provider assignment and abort session initialization. Inline its
