@@ -60,6 +60,9 @@ class EpCapabilities:
             stage).
         supports_fused_rope: ``False`` triggers SeparateRoPE + UnpackQKV
             lowering (DML).
+        dynamic_rope: Compute supported RoPE embeddings from position IDs and
+            inverse frequencies instead of looking up precomputed tables.
+            OpenVINO profiles use this representation to match Optimum exports.
         supports_skip_layer_norm: ``False`` expands SkipLayerNormalization /
             SkipSimplifiedLayerNormalization via InlinePass (TRT-RTX).
         supports_fused_moe: ``False`` decomposes fused MoE ops.
@@ -158,6 +161,7 @@ class EpCapabilities:
     gqa_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     supports_fused_rope: bool = True
+    dynamic_rope: bool = False
     supports_skip_layer_norm: bool = True
     supports_fused_moe: bool = True
     supports_packed_multi_head_attention: bool = False
@@ -304,6 +308,7 @@ def _register_builtins() -> None:
         # still opset-24; OpenVINO frontend support for it is pending.)
         EpCapabilities(
             name="openvino",
+            dynamic_rope=True,
             gqa_dtypes=frozenset(),  # no GQA fusion — keep standard Attention ops
             qkv_pack_dtypes=frozenset(),  # no QKV packing
             supports_skip_layer_norm=False,
@@ -314,6 +319,7 @@ def _register_builtins() -> None:
             # Experimental portable OpenVINO profile: retain ONNX Attention for
             # frontend SDPA conversion while preserving compressed-weight layout.
             name="openvino-sdpa",
+            dynamic_rope=True,
             preserve_linear_weight_orientation=True,
             supports_skip_layer_norm=False,
             provider_options={"device_type": "NPU"},
@@ -321,6 +327,7 @@ def _register_builtins() -> None:
         ),
         EpCapabilities(
             name="openvino-npu",
+            dynamic_rope=True,
             npuw_attention=True,
             preserve_linear_weight_orientation=True,
             supports_skip_layer_norm=False,
