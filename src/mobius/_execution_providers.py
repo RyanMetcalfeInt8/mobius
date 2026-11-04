@@ -77,6 +77,11 @@ class EpCapabilities:
         npuw_attention: Emit dynamic-cache primitive Attention with Q scaling,
             merged additive masks and an output guard after reshape for NPUW.
             Unsupported attention forms raise instead of silently falling back.
+        openvino_gdn: Preserve a FLOAT recurrent cell for the OpenVINO frontend's
+            sliced-Loop conversion and shape-derived query scaling.
+        gdn_value_scale: Experimental positive value/state scale, with RMS
+            epsilon and outgoing state compensation. Defaults to 1; non-unit
+            scaling requires separate validation of prefill cache padding.
         preserve_linear_weight_orientation: Keep initializer Transpose feeding
             MatMul RHS through post-loading folding for OpenVINO NPU export.
         supports_attention: ``False`` decomposes the fused opset-24
@@ -167,6 +172,10 @@ class EpCapabilities:
     supports_packed_multi_head_attention: bool = False
     supports_rank4_rmsnorm: bool = True
     npuw_attention: bool = False
+    # Emit the fusion-compatible GDN Loop and keep its value/state path scaled
+    # through output normalization to avoid NPU fp16 subnormal input flushing.
+    openvino_gdn: bool = False
+    gdn_value_scale: int = 1
     preserve_linear_weight_orientation: bool = False
     supports_attention: bool = True
     supports_matmul_nbits: bool = True
@@ -308,6 +317,7 @@ def _register_builtins() -> None:
         # still opset-24; OpenVINO frontend support for it is pending.)
         EpCapabilities(
             name="openvino",
+            openvino_gdn=True,
             dynamic_rope=True,
             gqa_dtypes=frozenset(),  # no GQA fusion — keep standard Attention ops
             qkv_pack_dtypes=frozenset(),  # no QKV packing
@@ -319,6 +329,7 @@ def _register_builtins() -> None:
             # Experimental portable OpenVINO profile: retain ONNX Attention for
             # frontend SDPA conversion while preserving compressed-weight layout.
             name="openvino-sdpa",
+            openvino_gdn=True,
             dynamic_rope=True,
             preserve_linear_weight_orientation=True,
             supports_skip_layer_norm=False,
@@ -327,6 +338,7 @@ def _register_builtins() -> None:
         ),
         EpCapabilities(
             name="openvino-npu",
+            openvino_gdn=True,
             dynamic_rope=True,
             npuw_attention=True,
             preserve_linear_weight_orientation=True,

@@ -232,7 +232,10 @@ class PostGatedRMSNorm(nn.Module):
         self.variance_epsilon = eps
         self.group_size = group_size
 
-    def forward(self, op: OpBuilder, hidden_states: ir.Value, gate: ir.Value):
+    def forward(
+        self, op: OpBuilder, hidden_states: ir.Value, gate: ir.Value, input_scale: float = 1.0
+    ):
+        epsilon = self.variance_epsilon * input_scale**2
         hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
         weight_f32 = op.Cast(self.weight, to=ir.DataType.FLOAT)
         if self.group_size is not None and self.group_size < self.hidden_size:
@@ -248,7 +251,7 @@ class PostGatedRMSNorm(nn.Module):
             normed = op.Mul(
                 op.Mul(
                     grouped,
-                    op.Reciprocal(op.Sqrt(op.Add(variance, self.variance_epsilon))),
+                    op.Reciprocal(op.Sqrt(op.Add(variance, epsilon))),
                 ),
                 grouped_weight,
             )
@@ -257,7 +260,7 @@ class PostGatedRMSNorm(nn.Module):
             normed = op.RMSNormalization(
                 hidden_f32,
                 weight_f32,
-                epsilon=self.variance_epsilon,
+                epsilon=epsilon,
                 stash_type=1,
                 axis=-1,
             )

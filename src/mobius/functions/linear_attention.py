@@ -50,6 +50,9 @@ def linear_attention(
     update_rule: str = "gated_delta",
     scale: float = 1.0,
     stash_type: ir.DataType = ir.DataType.FLOAT,
+    buffered_output: bool = False,
+    scalar_decay: bool = False,
+    openvino_gdn: bool = False,
 ) -> ir.Function:
     """Build an ir.Function for LinearAttention.
 
@@ -58,7 +61,8 @@ def linear_attention(
         key:        (B, T, q_num_heads * d_k)
         value:      (B, T, kv_num_heads * d_v)
         past_state: (B, kv_num_heads, d_k, d_v) — recurrent state
-        decay:      (B, T, kv_num_heads * d_k) — required when update_rule in ("gated", "gated_delta")
+        decay:      (B, T, kv_num_heads * d_k), or (B, T, kv_num_heads)
+                    with scalar_decay — required for "gated" and "gated_delta"
         beta:       (B, T, kv_num_heads) — required when update_rule in ("delta", "gated_delta")
 
     Outputs:
@@ -90,6 +94,15 @@ def linear_attention(
         stash_type: Element type for the Scan body's internal
             computation.  Must match the precision of the inputs
             passed at the call site.  Defaults to ``FLOAT``.
+        buffered_output: Collect tokens in a carried output buffer instead of
+            concatenated Scan outputs. Uses a standard ONNX Loop for OpenVINO.
+        scalar_decay: The buffered Loop receives one decay value per head,
+            with sequence layout [B,H,T]. Other exports retain per-channel decay.
+        openvino_gdn: Preserve a native-layout RecurrentGDN function boundary
+            and derive query scaling from sqrt(head_dim).
+            This mode replaces the supplied scale with 1/sqrt(head_dim).
+            Requires buffered gated_delta and scalar decay. The caller scales
+            value/state and compensates normalization epsilon and outgoing state.
 
     The function body handles 3D→4D reshape, GQA expansion, query
     scaling, and uses an ONNX Scan op for the sequential recurrence.
@@ -108,6 +121,12 @@ def linear_attention(
 
     uses_decay = update_rule in ("gated", "gated_delta")
     uses_beta = update_rule in ("delta", "gated_delta")
+    if scalar_decay and (not buffered_output or not uses_decay):
+        raise ValueError("scalar_decay requires a buffered Loop with decay")
+    if openvino_gdn and (
+        not buffered_output or not scalar_decay or update_rule != "gated_delta"
+    ):
+        raise ValueError("openvino_gdn requires buffered gated_delta with scalar decay")
 
     # --- Define function inputs ---
     # Always declare the full 6-input signature:
@@ -173,49 +192,92 @@ def linear_attention(
         # decay: (B, T, kv_num_heads * d_k) → (B, T, kv_num_heads, d_k)
         #     → transpose to (B, kv_num_heads, T, d_k)
         if uses_decay:
-            decay_4d = op.Transpose(
-                op.Reshape(decay_v, kv_4d_shape), perm=[0, 2, 1, 3]
-            )  # [B, kv_num_heads, T, d_k]
+            if scalar_decay:
+                decay_4d = op.Transpose(decay_v, perm=[0, 2, 1])  # [B,H,T]
+            else:
+                decay_4d = op.Transpose(
+                    op.Reshape(decay_v, kv_4d_shape), perm=[0, 2, 1, 3]
+                )  # [B, kv_num_heads, T, d_k]
         if uses_beta:
             # beta: (B, T, kv_num_heads) → transpose to (B, kv_num_heads, T)
             beta_3d = op.Transpose(beta_v, perm=[0, 2, 1])  # [B, kv_num_heads, T]
 
         # --- Apply query scale (matches op spec default of 1/sqrt(d_k)) ---
         # CastLike ensures scale constant matches the input dtype.
-        scaled_query = op.Mul(
-            query_expanded,
-            op.CastLike(op.Constant(value_float=scale), query_expanded),
-        )
+        if openvino_gdn:
+            # The OpenVINO GDN matcher recognizes sqrt(head_dim) explicitly.
+            # Scalar Gather preserves the scalar divisor used by that matcher.
+            head_dim = op.Gather(op.Shape(query_expanded), 3, axis=0)
+            divisor = op.Pow(op.Cast(head_dim, to=ir.DataType.FLOAT), 0.5)
+            scaled_query = op.Div(query_expanded, divisor)
+        else:
+            scaled_query = op.Mul(
+                query_expanded,
+                op.CastLike(op.Constant(value_float=scale), query_expanded),
+            )
 
         # --- Build Scan for sequential recurrence ---
         scan_body = _build_recurrence_body(uses_decay, uses_beta, stash_type=stash_type)
 
-        # Transpose to T-first for Scan: (B, H, T, D) -> (T, B, H, D)
-        q_t = op.Transpose(scaled_query, perm=[2, 0, 1, 3])
-        k_t = op.Transpose(key_expanded, perm=[2, 0, 1, 3])
-        v_t = op.Transpose(value_4d, perm=[2, 0, 1, 3])
+        # Keep the OpenVINO Loop in native [B, H, T, D] layout. Only Scan
+        # requires time-major inputs. Native Loop layout matches the compact
+        # recurrence representation used by OpenVINO exports.
+        q_t = (
+            scaled_query if buffered_output else op.Transpose(scaled_query, perm=[2, 0, 1, 3])
+        )
+        k_t = (
+            key_expanded if buffered_output else op.Transpose(key_expanded, perm=[2, 0, 1, 3])
+        )
+        v_t = value_4d if buffered_output else op.Transpose(value_4d, perm=[2, 0, 1, 3])
 
         scan_inputs = [q_t, k_t, v_t]
         if uses_decay:
-            decay_t = op.Transpose(decay_4d, perm=[2, 0, 1, 3])  # (T, B, H, d_k)
+            decay_t = (
+                decay_4d if buffered_output else op.Transpose(decay_4d, perm=[2, 0, 1, 3])
+            )
             scan_inputs.append(decay_t)
         if uses_beta:
-            beta_t = op.Transpose(beta_3d, perm=[2, 0, 1])  # (T, B, H)
+            beta_t = beta_3d if buffered_output else op.Transpose(beta_3d, perm=[2, 0, 1])
             scan_inputs.append(beta_t)
 
-        present_state_v, output_t = op.Scan(
-            past_state_v,  # carry: (B, H, d_k, d_v)
-            *scan_inputs,
-            body=scan_body,
-            num_scan_inputs=len(scan_inputs),
-            _outputs=2,
-        )
+        if openvino_gdn:
+            present_state_v, output_t = op.RecurrentGDN(
+                *scan_inputs,
+                past_state_v,
+                _domain="org.openvinotoolkit",
+                _version=1,
+                _outputs=2,
+            )
+        elif buffered_output:
+            initial_buffer = op.Expand(
+                op.CastLike(op.Constant(value_float=0.0), v_t), op.Shape(v_t)
+            )
+            trip_count = op.Squeeze(t_dim, op.Constant(value_ints=[0]))
+            _collect_in_buffer(scan_body, stash_type, scan_inputs, scalar_decay=scalar_decay)
+            present_state_v, output_t = op.Loop(
+                trip_count,
+                op.Cast(op.Constant(value_int=1), to=ir.DataType.BOOL),
+                past_state_v,
+                initial_buffer,
+                body=scan_body,
+                _outputs=2,
+            )
+        else:
+            present_state_v, output_t = op.Scan(
+                past_state_v,  # carry: (B, H, d_k, d_v)
+                *scan_inputs,
+                body=scan_body,
+                num_scan_inputs=len(scan_inputs),
+                _outputs=2,
+            )
         # present_state_v: (B, H, d_k, d_v)
-        # output_t: (T, B, H, d_v)
+        # output_t: (B, H, T, d_v) for Loop; (T, B, H, d_v) for Scan.
 
         # --- Reshape output 4D → 3D ---
         # (T, B, H, d_v) → (B, T, H, d_v) → (B, T, H*d_v)
-        output_bthd = op.Transpose(output_t, perm=[1, 0, 2, 3])
+        output_bthd = op.Transpose(
+            output_t, perm=[0, 2, 1, 3] if buffered_output else [1, 0, 2, 3]
+        )
         out_3d_shape = op.Concat(b_dim, t_dim, op.Constant(value_ints=[-1]), axis=0)
         output = op.Reshape(output_bthd, out_3d_shape)  # [B, T, H*d_v]
 
@@ -257,6 +319,156 @@ def linear_attention(
         ],
         opset_imports={"": OPSET_VERSION},
     )
+
+
+def recurrent_gdn() -> ir.Function:
+    """Portable fallback for OpenVINO's native-layout, FLOAT GDN conversion boundary.
+
+    Inputs are q/k/v [B,H,T,D], log-decay/beta [B,H,T], and state [B,H,Dk,Dv].
+    Outputs are final state followed by the sequence. Query scaling is external.
+    """
+    inputs = [
+        ir.Value(
+            name=name, type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([None] * rank)
+        )
+        for name, rank in (("q", 4), ("k", 4), ("v", 4), ("g", 3), ("beta", 3), ("state", 4))
+    ]
+
+    def body(op, q, k, v, g, beta, state):
+        shape = op.Shape(v)
+        buffer = op.Expand(op.Constant(value_float=0.0), shape)
+        trip = op.Gather(shape, 2, axis=0)
+        *_, final_state, sequence = op.Loop(
+            trip,
+            op.Cast(op.Constant(value_int=1), to=ir.DataType.BOOL),
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state,
+            buffer,
+            body=_build_openvino_gdn_body(ir.DataType.FLOAT),
+            _outputs=7,
+        )
+        return final_state, sequence
+
+    return build_function(
+        body,
+        inputs,
+        domain="org.openvinotoolkit",
+        name="RecurrentGDN",
+        opset_imports={"": OPSET_VERSION},
+    )
+
+
+def _build_openvino_gdn_body(stash_type: ir.DataType) -> ir.Graph:
+    """Standard ONNX recurrence used when the native conversion is unavailable."""
+    from onnxscript import GraphBuilder
+
+    dtype = ir.TensorType(stash_type)
+    index = ir.Value(
+        name="iteration", type=ir.TensorType(ir.DataType.INT64), shape=ir.Shape([])
+    )
+    condition = ir.Value(
+        name="condition", type=ir.TensorType(ir.DataType.BOOL), shape=ir.Shape([])
+    )
+    sequences = [
+        ir.Value(name=name, type=dtype, shape=ir.Shape([None] * rank))
+        for name, rank in (
+            ("query_sequence", 4),
+            ("key_sequence", 4),
+            ("value_sequence", 4),
+            ("decay_sequence", 3),
+            ("beta_sequence", 3),
+        )
+    ]
+    state = ir.Value(name="state", type=dtype, shape=ir.Shape([None] * 4))
+    buffer = ir.Value(name="output_buffer", type=dtype, shape=ir.Shape([None] * 4))
+    body = ir.Graph(
+        [index, condition, *sequences, state, buffer],
+        [],
+        nodes=[],
+        name="openvino_gdn",
+        opset_imports={"": OPSET_VERSION},
+    )
+    op = GraphBuilder(body).op
+    q, k, v, decay, beta = [op.Gather(sequence, index, axis=2) for sequence in sequences]
+    axes_neg1 = op.Constant(value_ints=[-1])
+    axes_neg2 = op.Constant(value_ints=[-2])
+    # Sliced scalar decay/beta become [B,H,1] after frontend conversion.
+    # Unsqueeze(decay, -1) is equivalent to the slice Squeeze/Unsqueeze pair.
+    decay_slice = op.Unsqueeze(decay, axes_neg1)
+    decayed = op.Mul(state, op.Unsqueeze(op.Exp(decay_slice), axes_neg1))
+    key_column = op.Unsqueeze(k, axes_neg1)
+    retrieved = op.ReduceSum(op.Mul(decayed, key_column), axes_neg2, keepdims=0)
+    delta = op.Mul(op.Sub(v, retrieved), op.Unsqueeze(beta, axes_neg1))
+    updated = op.Add(decayed, op.Mul(key_column, op.Unsqueeze(delta, axes_neg2)))
+    step = op.ReduceSum(op.Mul(updated, op.Unsqueeze(q, axes_neg1)), axes_neg2, keepdims=1)
+    # A rank-one index survives ScatterElements-to-ScatterUpdate conversion
+    # directly, matching ScatterUpdate(buffer, Unsqueeze(iteration, 0), step, 2).
+    indices = op.Expand(op.Unsqueeze(index, op.Constant(value_ints=[0])), op.Shape(step))
+    written = op.ScatterElements(buffer, indices, step, axis=2)
+    body.outputs.extend(
+        [
+            op.Identity(condition),
+            *[op.Identity(sequence) for sequence in sequences],
+            updated,
+            written,
+        ]
+    )
+    body.sort()
+    rename_subgraph_values(body, "gdn_")
+    return body
+
+
+def _collect_in_buffer(
+    body: ir.Graph,
+    stash_type: ir.DataType,
+    scan_inputs: list[ir.Value],
+    *,
+    scalar_decay: bool = False,
+) -> None:
+    """Convert the recurrence body to a Loop carrying state and token buffer."""
+    from onnxscript import GraphBuilder
+
+    # The buffer is always [B,H,T,D]. Leaving its shape absent can become
+    # scalar [] during downstream shape processing, causing ScatterElements
+    # conversion to fail before Loop propagates the initial buffer shape.
+    buffer = ir.Value(
+        name="output_buffer",
+        type=ir.TensorType(stash_type),
+        shape=ir.Shape([None, None, None, None]),
+    )
+    index = ir.Value(
+        name="output_index", type=ir.TensorType(ir.DataType.INT64), shape=ir.Shape([])
+    )
+    condition = ir.Value(
+        name="condition", type=ir.TensorType(ir.DataType.BOOL), shape=ir.Shape([])
+    )
+    state_input, *step_inputs = list(body.inputs)
+    body.inputs.clear()
+    body.inputs.extend([index, condition, state_input, buffer])
+    state, step = body.outputs
+    op = GraphBuilder(body).op
+    for input_index, (step_input, sequence) in enumerate(zip(step_inputs, scan_inputs)):
+        sliced = op.Gather(sequence, index, axis=2)
+        if scalar_decay and input_index == 3:
+            sliced = op.Unsqueeze(sliced, op.Constant(value_ints=[-1]))
+        step_input.replace_all_uses_with(sliced)
+    # Update one token slice rather than selecting over the entire buffer.
+    # ScatterElements (reduction=none) can be downgraded by OpenVINO's existing
+    # common transformations; ScatterND-24 requires a newer NPU operation.
+    step_slice = op.Unsqueeze(step, op.Constant(value_ints=[2]))
+    indices = op.Expand(
+        op.Reshape(index, op.Constant(value_ints=[1, 1, 1, 1])), op.Shape(step_slice)
+    )
+    updated = op.ScatterElements(buffer, indices, step_slice, axis=2)
+    next_condition = op.Identity(condition)
+    body.outputs.clear()
+    body.outputs.extend([next_condition, state, updated])
+    body.sort()
+    rename_subgraph_values(body, "buffer_")
 
 
 def _build_recurrence_body(
@@ -321,10 +533,11 @@ def _build_recurrence_body(
     else:
         state = state_in
 
-    # --- Retrieval: k @ state -> (B, H, d_v) ---
-    # k_row: (B, H, 1, d_k) @ state: (B, H, d_k, d_v) -> (B, H, 1, d_v)
-    k_row = bop.Unsqueeze(k_t, axes_neg2)
-    retrieval = bop.Squeeze(bop.MatMul(k_row, state), axes_neg2)
+    # Use broadcast products and reductions, matching Optimum's recurrent
+    # attention cell. These vector contractions do not require MatMul, and
+    # avoid exposing recurrent outputs as LM-head candidates in NPUW.
+    k_col = bop.Unsqueeze(k_t, axes_neg1)  # (B, H, d_k, 1)
+    retrieval = bop.ReduceSum(bop.Mul(k_col, state), axes_neg2, keepdims=0)
 
     # --- State update ---
     if uses_beta:
@@ -335,16 +548,15 @@ def _build_recurrence_body(
     else:
         delta = v_t
 
-    # Outer product: k^T @ delta -> (B, H, d_k, d_v)
-    k_col = bop.Unsqueeze(k_t, axes_neg1)  # (B, H, d_k, 1)
+    # Outer product: (B, H, d_k, 1) * (B, H, 1, d_v)
     delta_row = bop.Unsqueeze(delta, axes_neg2)  # (B, H, 1, d_v)
-    outer = bop.MatMul(k_col, delta_row)
+    outer = bop.Mul(k_col, delta_row)
     new_state = bop.Add(state, outer)
     new_state.name = "new_state"
 
     # --- Output: q @ new_state -> (B, H, d_v) ---
-    q_row = bop.Unsqueeze(q_t, axes_neg2)  # (B, H, 1, d_k)
-    output_t = bop.Squeeze(bop.MatMul(q_row, new_state), axes_neg2)
+    q_col = bop.Unsqueeze(q_t, axes_neg1)  # (B, H, d_k, 1)
+    output_t = bop.ReduceSum(bop.Mul(q_col, new_state), axes_neg2, keepdims=0)
     output_t.name = "output_t"
 
     body_graph.outputs.extend([new_state, output_t])

@@ -60,14 +60,13 @@ from onnxscript.rewriter import rewrite
 
 from mobius._execution_providers import EpCapabilities, ep_registry
 from mobius._flags import flags
-from mobius._passes._fold_rms_scale import FoldRmsScalePass
 from mobius._passes import (
     FoldConcatInitializersPass,
     FoldTransposedInitializerPass,
     Fp8KvCachePass,
     RemoveDeadGraphInputsPass,
 )
-from mobius.rewrite_rules._decompose_attention import NpuwAttentionPass
+from mobius._passes._fold_rms_scale import FoldRmsScalePass
 from mobius._pipeline_contract import requires_arbitrary_attention_mask
 from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
@@ -85,6 +84,7 @@ from mobius.rewrite_rules import (
     tensor_scatter_to_scatternd_rules,
     unpack_qkv_rules,
 )
+from mobius.rewrite_rules._decompose_attention import NpuwAttentionPass
 
 logger = logging.getLogger(__name__)
 
@@ -605,6 +605,12 @@ def optimize_model(
     # Register standard-ONNX ir.Function bodies for all known custom ops.
     # InlinePass below uses these to expand ops the EP cannot execute.
     register_function_bodies(model)
+    if caps.openvino_gdn:
+        from mobius.functions.linear_attention import recurrent_gdn
+
+        cell = recurrent_gdn()
+        model.functions[cell.identifier()] = cell
+        model.graph.opset_imports[cell.domain] = 1
 
     # Build InlinePass criteria: expand custom ops this EP doesn't support.
     def _should_inline(func: ir.Function) -> bool:
@@ -620,7 +626,9 @@ def optimize_model(
             and func.domain == "com.microsoft"
             and func.name in ("CausalConvWithState", "LinearAttention")
         ):
-            return True
+            # Expand GDN after folding: its Shape -> Gather -> Pow query
+            # divisor is part of OpenVINO's fusion contract.
+            return func.name != "LinearAttention"
         # ORT's CUDA EP has no CausalConvWithState kernel. Keeping the local
         # function call causes TransformerMemcpy to inspect a node without a
         # provider assignment and abort session initialization. Inline its
@@ -719,6 +727,13 @@ def optimize_model(
     )
     fold_pass(model)
 
+    if caps.openvino_gdn:
+        common_passes.InlinePass(
+            criteria=lambda func: (
+                func.domain == "com.microsoft" and func.name == "LinearAttention"
+            )
+        )(model)
+
     if trace:
         after_fold = sum(_count_all_ops(model).values())
         logger.info(
@@ -789,7 +804,7 @@ def optimize_model(
     model.graph.sort()
     if caps.preserve_linear_weight_orientation:
         # Weight loading/folding happens later and may enter through several integrations.
-        model.graph.metadata_props['mobius.preserve_linear_weight_orientation'] = 'true'
+        model.graph.metadata_props["mobius.preserve_linear_weight_orientation"] = "true"
     if caps.name == "onnx-standard":
         validate_standard_onnx(model, component=model.graph.name or model_role)
 
@@ -810,8 +825,12 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
             common_passes.LiftConstantsToInitializersPass(),
             FoldRmsScalePass(),
             FoldConcatInitializersPass(),
-            FoldTransposedInitializerPass(preserve_linear_weights=model.graph.metadata_props.get(
-                'mobius.preserve_linear_weight_orientation') == 'true'),
+            FoldTransposedInitializerPass(
+                preserve_linear_weights=model.graph.metadata_props.get(
+                    "mobius.preserve_linear_weight_orientation"
+                )
+                == "true"
+            ),
             common_passes.RemoveUnusedNodesPass(),
         ]
     )(model)
