@@ -219,6 +219,7 @@ class TextModel(nn.Module):
             attention_mask is not None
             and dtype in caps.gqa_dtypes
             and caps.supports_fused_rope
+            and not caps.dynamic_rope
             and isinstance(self.rotary_emb, BaseRope)
             and not isinstance(self.rotary_emb, _MRopeBase)
         )
