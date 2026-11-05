@@ -74,6 +74,8 @@ class EpCapabilities:
             (query/key norm over the head dimension) to rank-3 and back via
             HtpRank4RMSNorm.  ``True`` leaves it unchanged.  Set ``False``
             only for the QNN HTP, which miscomputes rank-4 RMSNormalization.
+        openvino_gdn: Preserve a FLOAT recurrent cell for the OpenVINO frontend's
+            sliced-Loop conversion and shape-derived query scaling.
         preserve_linear_weight_orientation: Keep initializer Transpose feeding
             MatMul RHS through post-loading folding for OpenVINO NPU export.
         supports_attention: ``False`` decomposes the fused opset-24
@@ -163,6 +165,8 @@ class EpCapabilities:
     supports_fused_moe: bool = True
     supports_packed_multi_head_attention: bool = False
     supports_rank4_rmsnorm: bool = True
+    # Preserve the native GDN conversion boundary for OpenVINO SDPA.
+    openvino_gdn: bool = False
     preserve_linear_weight_orientation: bool = False
     supports_attention: bool = True
     supports_matmul_nbits: bool = True
@@ -314,6 +318,7 @@ def _register_builtins() -> None:
             # Experimental portable OpenVINO profile: retain ONNX Attention for
             # frontend SDPA conversion while preserving compressed-weight layout.
             name="openvino-sdpa",
+            openvino_gdn=True,
             dynamic_rope=True,
             preserve_linear_weight_orientation=True,
             supports_skip_layer_norm=False,

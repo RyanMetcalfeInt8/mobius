@@ -1283,15 +1283,24 @@ class Gemma4TextAttention(nn.Module):
                 if keep_rank4_kv:
                     # ONNX rank-4 Attention consumes shared cache tensors directly.
                     query4 = op.Transpose(
-                        op.Reshape(query_states, [0, 0, self.num_attention_heads, self.head_dim]),
+                        op.Reshape(
+                            query_states, [0, 0, self.num_attention_heads, self.head_dim]
+                        ),
                         perm=[0, 2, 1, 3],
                     )
                     output4, present_key, present_value = op.Attention(
-                        query4, src_key, src_value, attention_bias,
-                        scale=self.scaling, softcap=self.softcap, is_causal=0,
+                        query4,
+                        src_key,
+                        src_value,
+                        attention_bias,
+                        scale=self.scaling,
+                        softcap=self.softcap,
+                        is_causal=0,
                         _outputs=3,
                     )
-                    attn_output = op.Reshape(op.Transpose(output4, perm=[0, 2, 1, 3]), [0, 0, -1])
+                    attn_output = op.Reshape(
+                        op.Transpose(output4, perm=[0, 2, 1, 3]), [0, 0, -1]
+                    )
                 else:
                     attn_output, present_key, present_value = _apply_attention(
                         op,
@@ -2253,7 +2262,7 @@ class Gemma4TextModel(nn.Module):
                     op.Constant(value_ints=[0, 0, num_layers, self._per_layer_dim]),
                 )
             )
-            if caps.name == "openvino-sdpa":
+            if caps.name in ("openvino", "openvino-sdpa"):
                 per_layer_list = [
                     op.Gather(per_layer_4d, op.Constant(value_int=i), axis=2)
                     for i in range(num_layers)

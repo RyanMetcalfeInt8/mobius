@@ -8,7 +8,9 @@ from __future__ import annotations
 import onnx_ir as ir
 import pytest
 
+from mobius._build_context import build_context
 from mobius._builder import _cast_module_dtype
+from mobius._execution_providers import ep_registry
 from mobius._testing import (
     count_op_type,
     create_test_builder,
@@ -16,6 +18,34 @@ from mobius._testing import (
     make_config,
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
+
+
+def test_openvino_state_interface():
+    config = make_config(
+        dtype=ir.DataType.FLOAT16,
+        mamba_ssm_dtype=ir.DataType.FLOAT,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+    )
+    module = GatedDeltaNet(config)
+    _cast_module_dtype(module, ir.DataType.FLOAT16)
+    builder, op, graph = create_test_builder()
+    hidden = create_test_input(builder, "hidden", [1, 1, 64], ir.DataType.FLOAT16)
+    conv = create_test_input(builder, "conv", [1, 128, 3], ir.DataType.FLOAT16)
+    state = create_test_input(builder, "state", [1, 4, 16, 16], ir.DataType.FLOAT)
+    capabilities = ep_registry.require("openvino-sdpa")
+    with build_context(capabilities, ir.DataType.FLOAT16):
+        output, _, present = module(op, hidden, conv, state)
+    attention = next(n for n in graph if n.op_type == "LinearAttention")
+    norm = next(n for n in graph if n.op_type == "RMSNormalization")
+    assert norm.attributes["epsilon"].value == pytest.approx(module.norm.variance_epsilon)
+    assert output.dtype == ir.DataType.FLOAT16
+    assert present.dtype == ir.DataType.FLOAT
+    assert attention.inputs[3] is state
+    assert present is attention.outputs[1]
 
 
 @pytest.mark.parametrize(
