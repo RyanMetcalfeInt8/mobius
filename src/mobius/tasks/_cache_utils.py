@@ -468,6 +468,8 @@ def _register_linear_attention_functions(
     )
 
     if has_deltanet:
+        from mobius._build_context import ep_capabilities
+
         dims = linear_attention_dims(config)
         conv_func = causal_conv_nd_with_state(
             kernel_size=dims.conv_kernel,
@@ -480,7 +482,10 @@ def _register_linear_attention_functions(
             kv_num_heads=dims.num_v_heads,
             update_rule="gated_delta",
             scale=1.0 / (dims.head_k_dim**0.5),
-            stash_type=getattr(config, "mamba_ssm_dtype", None) or config.dtype,
+            stash_type=ir.DataType.FLOAT
+            if ep_capabilities().openvino_gdn
+            else getattr(config, "mamba_ssm_dtype", None) or config.dtype,
+            openvino_gdn=ep_capabilities().openvino_gdn,
         )
         model.functions[conv_func.identifier()] = conv_func
         model.functions[attn_func.identifier()] = attn_func
