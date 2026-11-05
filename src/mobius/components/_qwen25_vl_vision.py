@@ -643,7 +643,11 @@ def _window_index_one_image(op, T, H, W, ms, ws, smu):  # noqa: N803
     seqlens = op.ReduceSum(op.Cast(valid, to=7), [1], keepdims=False)
 
     # Extract valid indices
-    window_index = op.Compress(op.Reshape(padded, [-1]), op.Reshape(valid, [-1]))
+    # Both inputs are vectors. Explicit axis avoids a redundant flatten/squeeze
+    # in runtimes that otherwise lose rank information for axis-free Compress.
+    window_index = op.Compress(
+        op.Reshape(padded, [-1]), op.Reshape(valid, [-1]), axis=0
+    )
 
     # cu_window: cumsum of per-window actual patch counts (no leading 0)
     seqlens_actual = op.Mul(seqlens, op.Constant(value_int=smu))
