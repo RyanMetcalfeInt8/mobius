@@ -2457,6 +2457,7 @@ class Gemma4TextModel(nn.Module):
                     sliding_window=self.sliding_window,
                     dtype=self._dtype,
                     block_sequence_ids=block_sequence_ids if use_block_overlay else None,
+                    physical_positions=caps.name == "openvino-sdpa",
                 ),
                 "full_attention": create_attention_bias(
                     op,
@@ -2464,6 +2465,7 @@ class Gemma4TextModel(nn.Module):
                     attention_mask=attention_mask,
                     dtype=self._dtype,
                     block_sequence_ids=block_sequence_ids if use_block_overlay else None,
+                    physical_positions=caps.name == "openvino-sdpa",
                 ),
             }
             fallback_pos_dict = position_embeddings_dict
