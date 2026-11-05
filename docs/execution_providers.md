@@ -666,3 +666,71 @@ cuda_pkg, dml_pkg = await asyncio.gather(build_cuda(), build_dml())
 
 This is implemented using Python's `contextvars` module, which provides
 copy-on-write isolation for threads and coroutines.
+
+
+### Portable OpenVINO SDPA export (`openvino-sdpa`)
+
+`execution_provider="openvino-sdpa"` retains ONNX Attention for frontend SDPA
+conversion and preserves compressed linear-weight orientation. For a standard
+`CausalLMModel` / `TextModel` with full attention, float32 activations, and the
+dynamic-cache `CausalLMTask`, the builder emits one shared additive causal and
+padding mask and sets `Attention.is_causal=0`. The mask uses bottom-right causal
+alignment during cached decode.
+
+This profile uses the task's full-length mask contract: every layer's key/value
+cache has the same past sequence length, and `attention_mask` has shape
+`[batch, past_length + query_length]`. Padding is represented by zero entries
+inside this full-length tensor. Shortened mask tensors are outside this profile;
+the default export retains Attention-24's shortened-mask support.
+
+Eligible graphs select opset 23 to avoid per-layer runtime mask padding.
+Alpha=1 Swish is lowered to `x * Sigmoid(x)`; other operators and tensor types
+are checked for opset-23 compatibility before making changes. The model records
+the mask contract in `mobius.openvino_sdpa.mask_contract` metadata.
+
+Static/paged caches, sliding or mixed attention schedules, custom model/task
+classes, non-float32 activations, softcapped attention, and incompatible graphs
+keep the existing export. This selection is independent of
+`MOBIUS_ORT_LOWER_OPSET_FOR_EP`. The OpenVINO device can be selected at runtime;
+the provider configuration still defaults to NPU.
+
+### Experimental OpenVINO NPU export (`openvino-npu`)
+
+This profile preserves `[out,in]` linear weights and their Transpose into
+MatMul through post-loading initializer folding. The workspace compression
+script uses the patched NNCF ONNX backend directly: it maps quantization
+axes through Transpose and selects
+`AdvancedCompressionParameters(onnx_decompression_dtype="float16")`.
+No temporary weight transposition, sidecar or post-compression surgery is
+needed. Shared weights retain their original graph connections.
+
+Use the local patched NNCF installation. F16 decompression changes rounding
+and needs accuracy validation. The `openvino-npu` profile selects f16
+decompression automatically; other profiles retain NNCF's default precision.
+
+Use `execution_provider="openvino-npu"` to build a Llama-style decoder for
+OpenVINO NPUW. This profile maps to the OpenVINO ORT provider with NPU as its
+device default; the existing `openvino` profile is unchanged.
+
+Decoder Attention uses dynamic-cache ONNX primitives with scaling on Q, GQA
+`Expand`, merged causal/padding masks, and a contiguous
+`MatMul ? Add ? Softmax ? MatMul ? Transpose ? Reshape` core. NaN-to-zero
+replacement is retained after the output reshape. Boolean/additive masks and
+shorter opset-24 masks are supported. Present caches retain KV-head geometry.
+Vision/encoder components keep their existing attention export path.
+
+The initial policy rejects rank-4 Attention inputs, absent dynamic past
+caches, static-cache nonpad inputs, softcap, QK debug outputs and explicit
+softmax_precision. It targets NPUW's decomposed-attention pattern; complete
+NPU partitioning and performance still require validation. Cache reorder and
+shared-cache topology can affect matching. Moving scaling ahead of MatMul can
+change rounding, particularly in FP16.
+
+```python
+from mobius import build
+package = build(model_id, execution_provider="openvino-npu")
+```
+
+The workspace conversion helper also accepts `--ep openvino-npu`. Use the
+local Mobius source/install. Keep NPUW_LLM enabled during direct OpenVINO
+compilation; generated ORT provider options do not configure that call.
