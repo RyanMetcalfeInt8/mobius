@@ -164,6 +164,7 @@ def create_attention_bias(
     sliding_window: int | None = None,
     dtype: ir.DataType = ir.DataType.FLOAT,
     block_sequence_ids=None,
+    physical_positions: bool = False,
 ):
     """Create causal attention bias for use in attention mechanisms.
 
@@ -172,6 +173,8 @@ def create_attention_bias(
         input_ids: Input tensor of shape (batch_size, query_length).
         attention_mask: Attention mask of shape (batch_size, total_length).
         sliding_window: Optional sliding window size for local attention.
+        physical_positions: Measure causal/window distance in cache slots, as
+            HuggingFace Gemma4 does, rather than cumulative valid-token counts.
         dtype: Data type for the bias tensor. The masked value uses the
             minimum representable value for this dtype (e.g. -65504 for
             float16, -3.4e38 for float32).
@@ -223,15 +226,29 @@ def create_attention_bias(
     # q_indices: (batch_size, query_length, 1)
     q_indices = op.Unsqueeze(q_indices_2d, [2])
 
+    if physical_positions:
+        # Gemma4's reference mask uses cache-slot indices; padding is applied
+        # separately below. Spell out the standard sliding-window comparisons
+        # so OpenVINO can recognize them without changing padding semantics.
+        zero = op.Constant(value_int=0)
+        one = op.Constant(value_int=1)
+        total = op.Squeeze(total_length, [0])
+        query_start = op.Squeeze(start, [0])
+        kv_indices = op.Unsqueeze(op.Range(zero, total, one), [0, 1])
+        q_indices = op.Unsqueeze(op.Range(query_start, total, one), [0, 2])
+
     # Causal mask: q_indices >= kv_indices
-    full_mask = op.GreaterOrEqual(q_indices, kv_indices)
+    full_mask = op.LessOrEqual(kv_indices, q_indices) if physical_positions else op.GreaterOrEqual(q_indices, kv_indices)
     if openvino_numeric_mask:
         full_mask = as_numeric_mask(full_mask)
 
     if sliding_window is not None:
         # Also mask out positions too far away
-        dist = op.Sub(q_indices, kv_indices)
-        within_window = op.Less(dist, sliding_window)
+        if physical_positions:
+            within_window = op.Greater(kv_indices, op.Sub(q_indices, sliding_window))
+        else:
+            dist = op.Sub(q_indices, kv_indices)
+            within_window = op.Less(dist, sliding_window)
         full_mask = (
             op.Mul(full_mask, as_numeric_mask(within_window))
             if openvino_numeric_mask
