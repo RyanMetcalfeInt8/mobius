@@ -790,6 +790,9 @@ def optimize_model(
 
     # Rewrites may insert producers after existing consumers.
     model.graph.sort()
+    if caps.preserve_linear_weight_orientation:
+        # Weight loading/folding happens later and may enter through several integrations.
+        model.graph.metadata_props['mobius.preserve_linear_weight_orientation'] = 'true'
     if caps.name == "onnx-standard":
         validate_standard_onnx(model, component=model.graph.name or model_role)
 
@@ -808,7 +811,8 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
         [
             common_passes.LiftConstantsToInitializersPass(),
             FoldConcatInitializersPass(),
-            FoldTransposedInitializerPass(),
+            FoldTransposedInitializerPass(preserve_linear_weights=model.graph.metadata_props.get(
+                'mobius.preserve_linear_weight_orientation') == 'true'),
             common_passes.RemoveUnusedNodesPass(),
         ]
     )(model)
